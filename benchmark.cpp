@@ -1,4 +1,4 @@
-// Copyright (c) 2021, Graphcore Ltd, All rights reserved.
+// Copyright (c) 2021 Graphcore Ltd. All rights reserved.
 
 #include <lyra/lyra.hpp>
 
@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include <poplar/CycleCount.hpp>
 #include <poplar/DeviceManager.hpp>
 #include <poplar/Engine.hpp>
 #include <poplar/IPUModel.hpp>
@@ -90,11 +91,17 @@ class Benchmark {
   uint32_t N_;
   uint32_t K_;
   float threshold_;
+  float scoreThreshold_;
+  float sigma_;
   uint32_t numClasses_;
   uint32_t batchSize_;
   bool fp16_;
   uint32_t tiles_;
   bool verif_;
+  bool measureCycles_;
+  bool useGather_;
+  bool large_;
+  uint32_t topk_;
 
   Device device_;
   Target target_;
@@ -112,7 +119,8 @@ class Benchmark {
 
 private:
   void prepareHostData() {
-    scores_ = gen_.generate(N_ * batchSize_);
+    scores_ =
+        gen_.generate(N_ * batchSize_ * std::max(numClasses_, uint32_t(1)));
     boxes_.reserve(batchSize_ * N_ * 4);
     for (size_t i = 0; i < batchSize_; ++i) {
       for (size_t j = 0; j < N_; ++j) {
@@ -126,13 +134,21 @@ private:
     }
     classes_ = gen_.labels(N_ * batchSize_);
     if (verif_) {
-      Shape scoresS{batchSize_, N_};
+      assert(numClasses_ >= 1);
       Shape boxesS{batchSize_, N_, 4};
-      NDArray<float> scoresA(scoresS, scores_);
       NDArray<float> boxesA(boxesS, boxes_);
-      NDArray<uint32_t> classesA(scoresS, classes_);
-      auto output = Nms(scoresA, boxesA, classesA, K_, threshold_);
-      refOutput_ = output.copy_data();
+      if (numClasses_ > 1) {
+        Shape scoresS{batchSize_, N_, numClasses_};
+        NDArray<float> scoresA(scoresS, scores_);
+        auto output = NmsMulti(scoresA, boxesA, K_, threshold_);
+        refOutput_ = output.copy_data();
+      } else {
+        Shape scoresS{batchSize_, N_};
+        NDArray<float> scoresA(scoresS, scores_);
+        NDArray<uint32_t> classesA(scoresS, classes_);
+        auto output = Nms(scoresA, boxesA, classesA, K_, threshold_);
+        refOutput_ = output.copy_data();
+      }
     }
   }
 
@@ -167,15 +183,51 @@ private:
 
   void prepareIpuData() {
     Type dataType = fp16_ ? poplar::HALF : poplar::FLOAT;
-    initData<float>(scoresT_, scores_, dataType, {batchSize_, N_}, 1, "scores");
     initData<float>(boxesT_, boxes_, dataType, {batchSize_, N_, 4}, 4, "boxes");
-    initData<uint32_t>(classesT_, classes_, poplar::UNSIGNED_INT,
-                       {batchSize_, N_}, 1, "classes");
+    if (numClasses_ > 1) {
+      initData<float>(scoresT_, scores_, dataType,
+                      {batchSize_, N_, numClasses_}, numClasses_, "scores");
+    } else {
+      initData<float>(scoresT_, scores_, dataType, {batchSize_, N_}, 1,
+                      "scores");
+      initData(classesT_, classes_, poplar::INT, {batchSize_, N_}, 1,
+               "classes");
+    }
   }
 
   void buildGraph(poplar::program::Sequence &prog) {
-    outputT_ = nms(graph_, prog, scoresT_, boxesT_, classesT_, threshold_, K_,
-                   "nmsBenchmark");
+    poplar::program::Sequence nmsSeq;
+    poplar::Tensor scores, boxes, classes, lengths;
+    if (large_) {
+      std::tie(outputT_, scores, boxes, classes, lengths) = nmsMultiLarge(
+          graph_, nmsSeq, scoresT_, boxesT_, threshold_, K_, scoreThreshold_,
+          useGather_, topk_, "nmsMultiLargeBenchmark");
+    } else {
+      if (numClasses_ > 1) {
+        std::tie(outputT_, scores, boxes, classes, lengths) =
+            nmsMulti(graph_, nmsSeq, scoresT_, boxesT_, threshold_, K_,
+                     scoreThreshold_, sigma_, useGather_, "nmsMultiBenchmark");
+
+      } else {
+        if (numClasses_ == 1) {
+          std::tie(outputT_, scores, boxes, classes, lengths) =
+              nms(graph_, nmsSeq, scoresT_, boxesT_, classesT_, threshold_, K_,
+                  scoreThreshold_, sigma_, useGather_, "nmsBenchmark");
+        } else {
+          std::tie(outputT_, scores, boxes, lengths) =
+              nms(graph_, nmsSeq, scoresT_, boxesT_, threshold_, K_,
+                  scoreThreshold_, sigma_, useGather_, "nmsBenchmark");
+        }
+      }
+    }
+    if (measureCycles_) {
+      auto cycles =
+          poplar::cycleCount(graph_, nmsSeq, 0, poplar::SyncType::EXTERNAL);
+      prog.add(nmsSeq);
+      prog.add(poplar::program::PrintTensor("NMS cycles", cycles));
+    } else {
+      prog.add(nmsSeq);
+    }
     if (verif_) {
       graph_.createHostRead("output-read", outputT_);
     }
@@ -186,19 +238,23 @@ private:
   }
 
 public:
-  Benchmark(uint32_t N, uint32_t K, float threshold, uint32_t classes,
-            uint32_t batchSize, bool fp16, uint32_t tiles, bool verif)
+  Benchmark(uint32_t N, uint32_t K, float threshold, float scoreThreshold,
+            float sigma, uint32_t classes, uint32_t batchSize, bool fp16,
+            uint32_t tiles, bool verif, bool measureCycles, bool useGather,
+            bool large, uint32_t topk)
       : gen_{1.0, classes}, N_{N}, K_{K}, threshold_{threshold},
-        numClasses_{classes},
+        scoreThreshold_{scoreThreshold}, sigma_{sigma}, numClasses_{classes},
         batchSize_{batchSize}, fp16_{fp16}, tiles_{tiles}, verif_{verif},
-        device_{getDevice()}, target_{device_.getTarget()}, graph_{target_} {
+        measureCycles_(measureCycles),
+        useGather_{useGather}, large_{large}, topk_{topk}, device_{getDevice()},
+        target_{device_.getTarget()}, graph_{target_} {
     if (tiles_ > 0) {
       device_ = device_.createVirtualDevice(tiles_);
       target_ = device_.getTarget();
       graph_ = Graph{target_};
     }
     popops::addCodelets(graph_);
-    graph_.addCodelets("codelet.gp");
+    graph_.addCodelets("codelet.cpp");
     popnn::addCodelets(graph_);
 
     prepareHostData();
@@ -234,21 +290,35 @@ int main(int argc, const char **argv) {
   uint32_t N = 10000;
   uint32_t classes = 1;
   uint32_t num_detections = 300;
+  uint32_t topk = 1;
   float threshold = 0.5;
+  float score_threshold = 0.0;
+  float sigma = 0.0;
   uint32_t tiles = 0;
   uint32_t batch_size = 1;
   bool show_help = false;
   bool fp16 = false;
   bool verif = false;
+  bool measureCycles = false;
+  bool useGather = false;
+  bool large = false;
   auto cli =
       lyra::help(show_help) |
       lyra::opt(N, "N")["-N"]("Number of scores/boxes.") |
       lyra::opt(num_detections, "K")["-K"]("Number of detections.") |
+      lyra::opt(classes, "C")["-C"]("Number of classes.") |
       lyra::opt(tiles, "t")["-t"]("Number of tiles on the IPU.") |
       lyra::opt(threshold, "T")["-T"]("Threshold.") |
+      lyra::opt(score_threshold, "S")["-S"]("Score threshold.") |
+      lyra::opt(sigma, "s")["-s"]("Sigma.") |
       lyra::opt(fp16, "0|1")["-F"]("Use fp16.") |
+      lyra::opt(useGather, "0|1")["-G"]("Use gather.") |
+      lyra::opt(large, "0|1")["-l"]("Use large nms.") |
+      lyra::opt(topk, "k")["-k"]("Number of topk for large nms.") |
       lyra::opt(verif, "0|1")["-v"](
           "Verification of results against reference version.") |
+      lyra::opt(measureCycles,
+                "0|1")["-m"]("Measure on device cycles around NMS.") |
       lyra::opt(batch_size, "batch size")["-b"]["--batch_size"]("Batch size.");
   auto result = cli.parse({argc, argv});
   if (!result) {
@@ -263,8 +333,20 @@ int main(int argc, const char **argv) {
   std::cout << "N=" << N << "\tK=" << num_detections << "\tT=" << threshold
             << "\tC=" << classes << "\tbatch size=" << batch_size
             << "\tfp16=" << fp16 << "\n";
-  Benchmark benchmark{N,          num_detections, threshold, classes,
-                      batch_size, fp16,           tiles,     verif};
+  Benchmark benchmark{N,
+                      num_detections,
+                      threshold,
+                      score_threshold,
+                      sigma,
+                      classes,
+                      batch_size,
+                      fp16,
+                      tiles,
+                      verif,
+                      measureCycles,
+                      useGather,
+                      large,
+                      topk};
   benchmark.run();
   return 0;
 }

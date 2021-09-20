@@ -1,4 +1,4 @@
-// Copyright (c) 2021, Graphcore Ltd, All rights reserved.
+// Copyright (c) 2021 Graphcore Ltd. All rights reserved.
 
 #pragma once
 #include <iostream>
@@ -56,6 +56,26 @@ public:
     engine.readTensor(name_, (char *)data_.data(),
                       (char *)data_.data() + sizeof(T) * data_.size());
     return data_;
+  }
+};
+
+class ReadHandleHalf {
+  std::vector<uint16_t> data_;
+  std::vector<float> dataFloat_;
+  std::string name_;
+
+public:
+  ReadHandleHalf(const poplar::Tensor &t, const std::string &name,
+                 poplar::Graph &graph)
+      : data_(t.numElements(), 0), name_{name} {
+    graph.createHostRead(name_, t);
+  }
+  const std::vector<float> &read(poplar::Engine &engine,
+                                 const poplar::Target &target) {
+    engine.readTensor(name_, (char *)data_.data(),
+                      (char *)data_.data() + sizeof(uint16_t) * data_.size());
+    dataFloat_ = to_float(target, data_);
+    return dataFloat_;
   }
 };
 

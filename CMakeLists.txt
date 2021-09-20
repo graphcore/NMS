@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.0.0)
-project(topk VERSION 0.1.0)
+cmake_minimum_required(VERSION 3.7.2)
+project(nms VERSION 0.1.0)
 
 #include(CTest)
 #enable_testing()
@@ -10,11 +10,11 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package (Threads REQUIRED)
 find_package(OpenMP REQUIRED)
-include_directories("3rd")
-
-add_executable(tests tests.cpp nms.cpp legacynms.cpp reference.cpp ipu_utils.cpp)
+include_directories("3rd_party")
+#set(CMAKE_CXX_CLANG_TIDY "clang-tidy")
+add_executable(tests tests.cpp nms.cpp reference.cpp ipu_utils.cpp)
 target_link_libraries (tests PUBLIC Threads::Threads OpenMP::OpenMP_CXX -lpopnn -lpoplar -lpoputil -lpopops -lpoplin)
-#add_executable(ipu_main ipu_main.cpp lbm.cpp reference.cpp ipu_utils.cpp)
+##add_executable(ipu_main ipu_main.cpp lbm.cpp reference.cpp ipu_utils.cpp)
 #target_link_libraries (ipu_main PUBLIC Threads::Threads OpenMP::OpenMP_CXX -lpoplar -lpoputil -lpopops -lpoplin)
 
 add_executable(benchmark benchmark.cpp nms.cpp ipu_utils.cpp reference.cpp)

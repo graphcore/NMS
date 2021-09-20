@@ -1,4 +1,4 @@
-// Copyright (c) 2021, Graphcore Ltd, All rights reserved.
+// Copyright (c) 2021 Graphcore Ltd. All rights reserved.
 
 #include "ipu_utils.hpp"
 
@@ -6,7 +6,6 @@
 #include <iostream>
 
 Device getDevice() {
-
   auto dm = DeviceManager::createDeviceManager();
   auto devices = dm.getDevices(TargetType::IPU, 1);
   std::cerr << "Found " << devices.size() << " devices ..." << std::endl;

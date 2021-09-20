@@ -1,0 +1,7 @@
+*.so
+*.swp
+*.gp
+./benchmark
+./tests
+.cache
+__pycache__

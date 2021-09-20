@@ -1,4 +1,4 @@
-// Copyright (c) 2021, Graphcore Ltd, All rights reserved.
+// Copyright (c) 2021 Graphcore Ltd. All rights reserved.
 
 #include "reference.hpp"
 #include <algorithm>
@@ -20,17 +20,16 @@ NDArray<uint32_t> sort_indices(const NDArray<float> &scores) {
   return index;
 }
 
-NDArray<uint32_t> argmax(const NDArray<float> &scores,
-                         const NDArray<uint8_t> &keep) {
+NDArray<uint32_t> argmax(const NDArray<float> &scores) {
   const auto dims = scores.dims();
   size_t batch = dims[0];
   size_t N = dims[1];
   NDArray<uint32_t> index{{batch}};
   for (size_t b = 0; b < batch; ++b) {
-    float best = std::numeric_limits<float>::min();
+    float best = -std::numeric_limits<float>::max();
     uint32_t best_index = std::numeric_limits<uint32_t>::max();
     for (size_t i = 0; i < N; ++i) {
-      if (keep[{b, i}] == 0 && scores[{b, i}] > best) {
+      if (scores[{b, i}] >= best) {
         best = scores[{b, i}];
         best_index = uint32_t(i);
       }
@@ -72,7 +71,7 @@ float compute_iou(const NDArray<float> &boxes, const NDArray<float> &areas,
 }
 
 void update_scores(NDArray<float> &scores, const NDArray<float> &boxes,
-                   const NDArray<float> &areas, const NDArray<uint8_t> &keep,
+                   const NDArray<float> &areas,
                    const NDArray<uint32_t> &classes,
                    const NDArray<uint32_t> &best, float threshold) {
   const auto dims = scores.dims();
@@ -81,10 +80,11 @@ void update_scores(NDArray<float> &scores, const NDArray<float> &boxes,
   for (size_t b = 0; b < batch; ++b) {
     uint32_t best_b = best[{b}];
     for (size_t i = 0; i < N; ++i) {
-      if (keep[{b, i}] == 0 && classes[{b, i}] == classes[{b, best_b}]) {
+      if (scores[{b, i}] > -std::numeric_limits<float>::max() &&
+          classes[{b, i}] == classes[{b, best_b}]) {
         float iou = compute_iou(boxes, areas, b, i, best_b);
         if (iou > threshold) { // soft-nms here !!
-          scores[{b, i}] = 0.0;
+          scores[{b, i}] = -std::numeric_limits<float>::max();
         }
       }
     }
@@ -107,21 +107,98 @@ NDArray<uint32_t> Nms(const NDArray<float> &scores, const NDArray<float> &boxes,
   assert(numDetections <= N);
   assert(boxes.shape().same_dims({batch, N, 4}));
   assert(classes.shape().same_dims({batch, N}));
-  NDArray<uint32_t> indices{{batch, numDetections}};
+  NDArray<uint32_t> indices{{batch, numDetections},
+                            std::numeric_limits<uint32_t>::max()};
   NDArray<float> areas = compute_area(boxes);
-  // areas.print(std::cerr);
-  NDArray<uint8_t> keep{{batch, N}, 0};
   NDArray<float> scores_copy{scores.shape(), scores.copy_data()};
-  NDArray<float> last_scores{indices.shape()};
   for (size_t i = 0; i < numDetections; ++i) {
-    NDArray<uint32_t> best = argmax(scores_copy, keep);
+    NDArray<uint32_t> best = argmax(scores_copy);
     for (size_t b = 0; b < batch; ++b) {
-      keep[{b, size_t(best[{b}])}] = 1; // mark the best indices
-      indices[{b, i}] = best[{b}];
-      last_scores[{b, i}] = scores_copy[{b, best[{b}]}];
-      scores_copy[{b, best[{b}]}] = std::numeric_limits<float>::min();
+      if (scores_copy[{b, best[{b}]}] > -std::numeric_limits<float>::max()) {
+        indices[{b, i}] = best[{b}];
+        scores_copy[{b, best[{b}]}] = -std::numeric_limits<float>::max();
+      }
     }
-    update_scores(scores_copy, boxes, areas, keep, classes, best, threshold);
+    update_scores(scores_copy, boxes, areas, classes, best, threshold);
+  }
+  return indices;
+}
+
+NDArray<uint32_t> multiArgmax(const NDArray<float> &scores) {
+  const auto dims = scores.dims();
+  const size_t batch = dims[0];
+  const size_t N = dims[1];
+  const size_t C = dims[2];
+  NDArray<uint32_t> index{{batch, 2}};
+  for (size_t b = 0; b < batch; ++b) {
+    float best = -std::numeric_limits<float>::max();
+    uint32_t best_index = std::numeric_limits<uint32_t>::max();
+    uint32_t best_class = std::numeric_limits<uint32_t>::max();
+    for (size_t i = 0; i < N; ++i) {
+      for (size_t j = 0; j < C; ++j) {
+        if (scores[{b, i, j}] >= best) {
+          best = scores[{b, i, j}];
+          best_index = uint32_t(i);
+          best_class = uint32_t(j);
+        }
+      }
+    }
+    index[{b, 0}] = best_index;
+    index[{b, 1}] = best_class;
+  }
+  return index;
+}
+
+void updateMultiScores(NDArray<float> &scores, const NDArray<float> &boxes,
+                       const NDArray<float> &areas,
+                       const NDArray<uint32_t> &best, float threshold) {
+  const auto dims = scores.dims();
+  const size_t batch = dims[0];
+  const size_t N = dims[1];
+  for (size_t b = 0; b < batch; ++b) {
+    uint32_t best_b = best[{b, 0}];
+    uint32_t best_c = best[{b, 1}];
+    for (size_t i = 0; i < N; ++i) {
+      if (scores[{b, i, best_c}] > -std::numeric_limits<float>::max()) {
+        float iou = compute_iou(boxes, areas, b, i, best_b);
+        if (iou > threshold) { // soft-nms here !!
+          scores[{b, i, best_c}] = -std::numeric_limits<float>::max();
+        }
+      }
+    }
+  }
+}
+
+NDArray<uint32_t> NmsMulti(const NDArray<float> &scores,
+                           const NDArray<float> &boxes, uint32_t numDetections,
+                           float threshold) {
+  // scores: [batch, N, C]
+  // boxes: [batch, N, 4]
+  // return indices: [batch, K, 2] // [idx_boxes, idx_classes] N,C
+
+  assert(scores.shape().rank() == 3);
+  const auto dims = scores.dims();
+  const size_t batch = dims[0];
+  const size_t N = dims[1];
+  assert(boxes.shape().rank() == 3);
+  assert(numDetections <= N);
+  assert(boxes.shape().same_dims({batch, N, 4}));
+  NDArray<uint32_t> indices{{batch, numDetections, 2},
+                            std::numeric_limits<uint32_t>::max()};
+  NDArray<float> areas = compute_area(boxes);
+  NDArray<float> scores_copy{scores.shape(), scores.copy_data()};
+  for (size_t i = 0; i < numDetections; ++i) {
+    NDArray<uint32_t> best = multiArgmax(scores_copy);
+    for (size_t b = 0; b < batch; ++b) {
+      if (scores_copy[{b, best[{b, 0}], best[{b, 1}]}] >
+          std::numeric_limits<float>::min()) {
+        indices[{b, i, 0}] = best[{b, 0}];
+        indices[{b, i, 1}] = best[{b, 1}];
+        scores_copy[{b, best[{b, 0}], best[{b, 1}]}] =
+            -std::numeric_limits<float>::max();
+      }
+    }
+    updateMultiScores(scores_copy, boxes, areas, best, threshold);
   }
   return indices;
 }

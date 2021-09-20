@@ -1,4 +1,4 @@
-// Copyright (c) 2021, Graphcore Ltd, All rights reserved.
+// Copyright (c) 2021 Graphcore Ltd. All rights reserved.
 
 #pragma once
 #include "ipu_utils.hpp"
@@ -133,6 +133,11 @@ public:
   void connect(const Variable<T> &v, Args &&... args) {
     connect(v);
     connect(args...);
+  }
+
+  template <typename T>
+  void initialValue(const std::string &name, const T &val) {
+    graph_.setInitialValue(vertex_[name], val);
   }
 
   void loadAndRun(Device &device, bool printTensors = false) {
